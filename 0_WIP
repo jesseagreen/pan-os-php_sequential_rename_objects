@@ -1,0 +1,534 @@
+<?php
+
+// load PAN-OS-PHP library
+require_once("lib/pan_php_framework.php");
+require_once "utils/lib/UTIL.php";
+
+PH::print_stdout();
+PH::print_stdout("*********** START OF SCRIPT ".basename(__FILE__)." ************" );
+PH::print_stdout();
+
+$supportedArguments = array();
+
+// PREDEFINED arguments:
+$supportedArguments['in'] = array('niceName' => 'in', 'shortHelp' => 'in=filename.xml | api. ie: in=api://192.168.1.1 or in=api://serial@panorama.company.com', 'argDesc' => '[filename]|[api://IP]|[api://serial@IP]');
+$supportedArguments['out'] = array('niceName' => 'out', 'shortHelp' => 'output file to save config after changes. Only required when input is a file. ie: out=save-config.xml', 'argDesc' => '[filename]');
+$supportedArguments['debugapi'] = array('niceName' => 'DebugAPI', 'shortHelp' => 'prints API calls when they happen');
+$supportedArguments['help'] = array('niceName' => 'help', 'shortHelp' => 'this message');
+$supportedArguments['location'] = array('niceName' => 'Location', 'shortHelp' => 'specify if you want to limit your query to a VSYS/DG. By default location=shared for Panorama, =vsys1 for PANOS. ie: location=any or location=vsys2,vsys1', 'argDesc' => '=sub1[,sub2]');
+$supportedArguments['loadpanoramapushedconfig'] = array('niceName' => 'loadPanoramaPushedConfig', 'shortHelp' => 'load Panorama pushed config from the firewall to take in account panorama objects and rules');
+$supportedArguments['apitimeout'] = array('niceName' => 'apiTimeout', 'shortHelp' => 'in case API takes too long time to answer, increase this value (default=60)');
+$supportedArguments['shadow-disableoutputformatting'] = array('niceName' => 'shadow-disableoutputformatting', 'shortHelp' => 'XML output in offline config is not in cleaned PHP DOMDocument structure');
+$supportedArguments['shadow-enablexmlduplicatesdeletion'] = array('niceName' => 'shadow-enablexmlduplicatesdeletion', 'shortHelp' => 'if duplicate objects are available, keep only one object of the same name');
+$supportedArguments['shadow-ignoreinvalidaddressobjects'] = array('niceName' => 'shadow-ignoreinvalidaddressobjects', 'shortHelp' => 'PAN-OS allow to have invalid address objects available, like object without value or type');
+$supportedArguments['shadow-apikeynohidden'] = array('niceName' => 'shadow-apikeynohidden', 'shortHelp' => 'send API-KEY in clear text via URL. this is needed for all PAN-OS version <9.0 if API mode is used.');
+$supportedArguments['shadow-apikeynosave'] = array('niceName' => 'shadow-apikeynosave', 'shortHelp' => 'do not store API key in .panconfkeystore file');
+$supportedArguments['shadow-displaycurlrequest'] = array('niceName' => 'shadow-displaycurlrequest', 'shortHelp' => 'display curl information if running in API mode');
+$supportedArguments['shadow-reducexml'] = array('niceName' => 'shadow-reducexml', 'shortHelp' => 'store reduced XML, without newline and remove blank characters in offline mode');
+$supportedArguments['shadow-json'] = array('niceName' => 'shadow-json', 'shortHelp' => 'BETA command to display output on stdout not in text but in JSON format');
+
+// YOUR OWN arguments if needed
+$supportedArguments['argument1'] = array('niceName' => 'ARGUMENT1', 'shortHelp' => 'an argument you like to use in your script');
+$supportedArguments['optional_argument2'] = array('niceName' => 'Optional_Argument2', 'shortHelp' => 'an argument you like to define here');
+
+$usageMsg = PH::boldText('USAGE: ') . "php " . basename(__FILE__) . " in=api:://[MGMT-IP] argument1 [optional_argument2]";
+
+$util = new UTIL("custom", $argv, $argc, __FILE__, $supportedArguments, $usageMsg);
+
+$util->utilInit();
+$util->load_config();
+$util->location_filter();
+
+/** @var PANConf|PanoramaConf $pan */
+$pan = $util->pan;
+
+/** @var VirtualSystem|DeviceGroup $sub */
+$sub = $util->sub;
+
+/** @var string $location */
+$location = $util->location;
+
+/** @var boolean $apiMode */
+$apiMode = $util->apiMode;
+
+/** @var array $args */
+$args = PH::$args;
+
+PH::print_stdout();
+PH::print_stdout("    **********     **********");
+PH::print_stdout();
+
+/*********************************
+* 
+* *  START WRITING YOUR CODE HERE
+* 
+* * List of available variables:
+*
+* * $pan : PANConf or PanoramaConf object
+* * $location : string with location name or undefined if not provided on CLI
+* * $sub : DeviceGroup or VirtualSystem found after looking from cli 'location' argument
+* * $apiMode : if config file was downloaded from API directly
+* * $args : array with all CLI arguments processed by PAN-OS-PHP
+*
+*/
+
+
+#####################################
+# Step 1: Traverse rules to find referenced DAGs (source/destination)
+#####################################
+
+$ruleStore = $sub->securityRules;
+$dagRuleRefs = []; // DAG name => metadata
+
+foreach( $ruleStore->rules() as $rule ) {
+    foreach( ['source', 'destination'] as $dir ) {
+        $field = ($dir === 'source') ? $rule->source : $rule->destination;
+
+        foreach( $field->getAll() as $entryName ) {
+            $dagObj = $sub->addressGroupStore->find($entryName);
+
+            if( $dagObj === null || !$dagObj->isDynamic() ) {
+                continue;
+            }
+
+            if( !isset($dagRuleRefs[$entryName]) ) {
+                $dagRuleRefs[$entryName] = [
+                    'dag' => $dagObj,
+                    'usedIn' => []
+                ];
+            }
+
+            $dagRuleRefs[$entryName]['usedIn'][] = [
+                'rule' => $rule,
+                'direction' => $dir
+            ];
+        }
+    }
+}
+
+PH::print_stdout("Found ".count($dagRuleRefs)." DAGs referenced in security rules.");
+
+#####################################
+# Step 2: For each discovered DAG, resolve match criteria and nested members
+#####################################
+
+foreach( $dagRuleRefs as $dagName => &$info ) {
+    $dag = $info['dag'];
+
+    // DAG match filter expression (e.g. 'tag1 or tag2')
+    $info['matchCriteria'] = $dag->getFilter();
+
+    // Get all address objects matching the DAG's tag criteria
+    $nestedObjects = $dag->nestedAddressObjects(true); // true = skip invalid objects
+    $info['nestedMembers'] = [];
+
+    foreach( $nestedObjects as $addrObj ) {
+        $info['nestedMembers'][] = $addrObj->name();
+    }
+}
+unset($info); // break reference to avoid bugs
+
+PH::print_stdout("Resolved match criteria and nested members for ".count($dagRuleRefs)." DAGs.");
+
+#####################################
+# Step 3: Output CSV showing rule-to-DAG relationships
+#####################################
+
+$csvFilename = 'dag_to_rule_map.csv';
+$csvHandle = fopen($csvFilename, 'w');
+
+// CSV Header
+fputcsv($csvHandle, ['Rule Name', 'Direction', 'DAG Name', 'Match Criteria', 'Nested Member']);
+
+foreach( $dagRuleRefs as $dagName => $info ) {
+    $criteria = $info['matchCriteria'];
+    $members = $info['nestedMembers'];
+
+    foreach( $info['usedIn'] as $usage ) {
+        $ruleName = $usage['rule']->name();
+        $direction = $usage['direction'];
+
+        // Write each member as separate row
+        foreach( $members as $memberName ) {
+            fputcsv($csvHandle, [$ruleName, $direction, $dagName, $criteria, $memberName]);
+        }
+    }
+}
+
+fclose($csvHandle);
+PH::print_stdout("CSV output written to $csvFilename");
+
+#####################################
+# Step 4: Create static AGs and update rules
+#####################################
+
+foreach( $dagRuleRefs as $dagName => $info ) {
+    $dag = $info['dag'];
+    $nestedMembers = $info['nestedMembers'];
+    $chunks = array_chunk($nestedMembers, 1000); // Max 1000 members per SAG
+
+    $sagNames = [];
+    $i = 1;
+
+    foreach( $chunks as $memberGroup ) {
+        // Increment suffix until a unique SAG name is found
+        do {
+            $sagName = $dagName . '-SAG' . str_pad($i, 2, '0', STR_PAD_LEFT);
+            $i++;
+            $existingSAG = $sub->addressGroupStore->find($sagName);
+        } while( $existingSAG !== null );
+
+        // Create new static address group
+        $newSAG = $sub->addressGroupStore->createTmp($sagName);
+        $newSAG->setType('static');
+
+        foreach( $memberGroup as $memberName ) {
+            $addrObj = $sub->addressStore->find($memberName);
+            if( $addrObj !== null ) {
+                $newSAG->addMember($addrObj);
+            }
+        }
+
+        // Add comment for tracking conversion
+        $existingComment = $newSAG->get_comment();
+        if( strpos($existingComment, 'Pan-os-php-Converted-DAG-to-SAG') === false ) {
+            $newSAG->set_comment(trim($existingComment . ' -Pan-os-php-Converted-DAG-to-SAG'));
+        }
+
+        PH::print_stdout("Created SAG: $sagName");
+        $sagNames[] = $sagName;
+    }
+
+    // Update all rules using this DAG
+    foreach( $info['usedIn'] as $usage ) {
+        $rule = $usage['rule'];
+        $direction = $usage['direction'];
+        $field = ($direction === 'source') ? $rule->source : $rule->destination;
+
+        if( $field->hasObject($dagName) ) {
+            $field->remove($dagName);
+            foreach( $sagNames as $sagNameToAdd ) {
+                $field->add($sagNameToAdd);
+            }
+            PH::print_stdout("Updated rule '".$rule->name()."' ($direction): Replaced $dagName with SAG(s) ".implode(', ', $sagNames));
+        }
+    }
+}
+
+#####################################
+# Step 5: Strip DAG match tags from address objects
+#####################################
+
+$tagsToRemove = [];
+
+// Extract all unique tag names from DAG match criteria
+foreach( $dagRuleRefs as $dagName => $info ) {
+    $filter = $info['matchCriteria'];
+
+    // Match words that look like tag names (alphanumeric and dashes/underscores)
+    preg_match_all('/[a-zA-Z0-9\-_\.]+/', $filter, $matches);
+    foreach( $matches[0] as $tagName ) {
+        $tagsToRemove[$tagName] = true;
+    }
+}
+$tagsToRemove = array_keys($tagsToRemove);
+PH::print_stdout("Found ".count($tagsToRemove)." unique tags to remove from address objects.");
+
+// Loop through all address objects and remove matching tags
+foreach( $sub->addressStore->all() as $addrObj ) {
+    if( !$addrObj->isAddress() ) continue;
+
+    $tags = $addrObj->tags->tags();
+
+    foreach( $tags as $tagObj ) {
+        if( in_array($tagObj->name(), $tagsToRemove, true) ) {
+            $addrObj->tags->removeTag($tagObj);
+            PH::print_stdout("Removed tag '".$tagObj->name()."' from address object '".$addrObj->name()."'");
+        }
+    }
+}
+
+#####################################
+# Step 6: Output CSV of tag removals and SAG membership
+#####################################
+
+$tagRemovalLog = [];
+$sagMembershipMap = [];
+
+// Build SAG membership map from Step 4
+foreach( $dagRuleRefs as $dagName => $info ) {
+    foreach( $info['nestedMembers'] as $memberName ) {
+        // Include every SAG that was created
+        foreach( $sub->addressGroupStore->all() as $ag ) {
+            if( !$ag->isDynamic() && strpos($ag->name(), $dagName . '-SAG') === 0 && $ag->has($memberName) ) {
+                $sagMembershipMap[$memberName][] = $ag->name();
+            }
+        }
+    }
+}
+
+// Re-loop address objects to gather final tag removals (after Step 5)
+foreach( $sub->addressStore->all() as $addrObj ) {
+    $name = $addrObj->name();
+    if( !isset($sagMembershipMap[$name]) ) continue;
+
+    $initialTags = $addrObj->tags->tags(true); // true = return tag names as strings
+    foreach( $tagsToRemove as $tag ) {
+        if( in_array($tag, $initialTags, true) ) {
+            $tagRemovalLog[] = [
+                'address' => $name,
+                'tag' => $tag,
+                'sag_membership' => implode('; ', $sagMembershipMap[$name])
+            ];
+        }
+    }
+}
+
+// Output CSV
+$csvFile = 'address_tag_cleanup_report.csv';
+$csvHandle = fopen($csvFile, 'w');
+fputcsv($csvHandle, ['Address Object', 'Tag Removed', 'Static Address Group(s)']);
+
+foreach( $tagRemovalLog as $entry ) {
+    fputcsv($csvHandle, [
+        $entry['address'],
+        $entry['tag'],
+        $entry['sag_membership']
+    ]);
+}
+
+fclose($csvHandle);
+PH::print_stdout("CSV output written to $csvFile");
+
+#####################################
+# Step 6: Output CSV of tag removals and SAG membership
+#####################################
+
+$tagRemovalLog = [];
+$sagMembershipMap = [];
+
+// Build SAG membership map from Step 4
+foreach( $dagRuleRefs as $dagName => $info ) {
+    foreach( $info['nestedMembers'] as $memberName ) {
+        // Include every SAG that was created
+        foreach( $sub->addressGroupStore->all() as $ag ) {
+            if( !$ag->isDynamic() && strpos($ag->name(), $dagName . '-SAG') === 0 && $ag->has($memberName) ) {
+                $sagMembershipMap[$memberName][] = $ag->name();
+            }
+        }
+    }
+}
+
+// Re-loop address objects to gather final tag removals (after Step 5)
+foreach( $sub->addressStore->all() as $addrObj ) {
+    $name = $addrObj->name();
+    if( !isset($sagMembershipMap[$name]) ) continue;
+
+    $initialTags = $addrObj->tags->tags(true); // true = return tag names as strings
+    foreach( $tagsToRemove as $tag ) {
+        if( in_array($tag, $initialTags, true) ) {
+            $tagRemovalLog[] = [
+                'address' => $name,
+                'tag' => $tag,
+                'sag_membership' => implode('; ', $sagMembershipMap[$name])
+            ];
+        }
+    }
+}
+
+// Output CSV
+$csvFile = 'address_tag_cleanup_report.csv';
+$csvHandle = fopen($csvFile, 'w');
+fputcsv($csvHandle, ['Address Object', 'Tag Removed', 'Static Address Group(s)']);
+
+foreach( $tagRemovalLog as $entry ) {
+    fputcsv($csvHandle, [
+        $entry['address'],
+        $entry['tag'],
+        $entry['sag_membership']
+    ]);
+}
+
+fclose($csvHandle);
+PH::print_stdout("CSV output written to $csvFile");
+
+#####################################
+# Step 7: Save updated configuration to XML (if out= is set)
+#####################################
+
+$util->save_our_work();
+
+#####################################
+# Step 8: Check if removed tags are still used outside of security rules
+#####################################
+
+$tagUsageReport = [];
+$securityRules = $sub->securityRules->rules();
+
+// Step 1: Build a set of tag names we already removed from address objects
+$removedTagNames = $tagsToRemove;
+
+// Step 2: For each tag, check where else it’s used in the config
+foreach( $removedTagNames as $tagName ) {
+    $tagObj = $sub->tagStore->find($tagName);
+    if( $tagObj === null ) continue;
+
+    // Skip if the tag has no references
+    if( $tagObj->countReferences() === 0 ) continue;
+
+    foreach( $tagObj->getReferences() as $ref ) {
+        $refClass = get_class($ref);
+        $refName = method_exists($ref, 'name') ? $ref->name() : '[no name]';
+
+        // Skip if it's a reference inside a security rule
+        if( $ref instanceof SecurityRule ) {
+            continue;
+        }
+
+        // Add to CSV list
+        $tagUsageReport[] = [
+            'Tag' => $tagName,
+            'Object Type' => $refClass,
+            'Object Name' => $refName
+        ];
+    }
+}
+
+// Step 3: Output to CSV
+$csvFile = 'tag_still_in_use_elsewhere.csv';
+$csvHandle = fopen($csvFile, 'w');
+fputcsv($csvHandle, ['Tag', 'Object Type', 'Object Name']);
+
+foreach( $tagUsageReport as $entry ) {
+    fputcsv($csvHandle, [
+        $entry['Tag'],
+        $entry['Object Type'],
+        $entry['Object Name']
+    ]);
+}
+
+fclose($csvHandle);
+PH::print_stdout("CSV written for remaining tag usage: $csvFile");
+
+#####################################
+# Step 9: Compare rules between original input and modified output config
+#####################################
+
+if( !$util->isAPI && isset(PH::$args['out']) ) {
+    $inputFilename = $util->loadArguments['in'];
+    $outputFilename = PH::$args['out'];
+
+    if( !is_file($inputFilename) || !is_file($outputFilename) ) {
+        PH::print_stdout("Cannot perform rule compare: input or output file not found.");
+    } else {
+        // Load both config files
+        $conf1 = new PANConf();
+        $conf1->load_from_file($inputFilename);
+
+        $conf2 = new PANConf();
+        $conf2->load_from_file($outputFilename);
+
+        // Use same location/device-group
+        $sub1 = $conf1->findSubSystemByName($util->location);
+        $sub2 = $conf2->findSubSystemByName($util->location);
+
+        if( $sub1 === null || $sub2 === null ) {
+            PH::print_stdout("Could not locate matching device-group or vsys in both configs for rule comparison.");
+        } else {
+            $ruleStore1 = $sub1->securityRules;
+            $ruleStore2 = $sub2->securityRules;
+
+            $csvFile = 'rule_comparison_report.csv';
+            $csvHandle = fopen($csvFile, 'w');
+            fputcsv($csvHandle, ['Rule Name', 'Field', 'Original Value', 'New Value']);
+
+            foreach( $ruleStore1->rules() as $rule1 ) {
+                $rule2 = $ruleStore2->find($rule1->name());
+                if( $rule2 === null ) continue;
+
+                // Compare source and destination fields
+                $fieldsToCompare = ['source', 'destination'];
+
+                foreach( $fieldsToCompare as $fieldName ) {
+                    $origValues = $rule1->$fieldName->getAll();
+                    $newValues = $rule2->$fieldName->getAll();
+
+                    if( $origValues !== $newValues ) {
+                        fputcsv($csvHandle, [
+                            $rule1->name(),
+                            $fieldName,
+                            implode('; ', $origValues),
+                            implode('; ', $newValues)
+                        ]);
+                    }
+                }
+            }
+
+            fclose($csvHandle);
+            PH::print_stdout("Rule comparison report written to $csvFile");
+        }
+    }
+}
+
+#####################################
+# Step 10: Compare config file size before and after conversion
+#####################################
+
+function getFileSizeInKB($filename) {
+    return round(filesize($filename) / 1024, 2); // in KB
+}
+
+function getReadOnlySectionSize($xmlString) {
+    $size = 0;
+
+    // Match <readonly>...</readonly> or <pushed>...</pushed> blocks
+    if( preg_match('/<readonly>.*?<\/readonly>/s', $xmlString, $match) ) {
+        $size += strlen($match[0]);
+    }
+    if( preg_match('/<pushed>.*?<\/pushed>/s', $xmlString, $match) ) {
+        $size += strlen($match[0]);
+    }
+
+    return round($size / 1024, 2); // in KB
+}
+
+// Validate both files
+if( !$util->isAPI && isset(PH::$args['out']) ) {
+    $file1 = $util->loadArguments['in'];
+    $file2 = PH::$args['out'];
+
+    if( file_exists($file1) && file_exists($file2) ) {
+        $size1 = getFileSizeInKB($file1);
+        $size2 = getFileSizeInKB($file2);
+        $reduction = round((1 - ($size2 / $size1)) * 100, 2);
+
+        // Read original XML to check read-only sections
+        $xml1 = file_get_contents($file1);
+        $readOnlySize = getReadOnlySectionSize($xml1);
+
+        PH::print_stdout("--------- CONFIG SIZE SUMMARY ---------");
+        PH::print_stdout("Original config file: $file1");
+        PH::print_stdout("Size: {$size1} KB");
+        PH::print_stdout("Read-only or pushed section size: {$readOnlySize} KB");
+
+        PH::print_stdout("Converted config file: $file2");
+        PH::print_stdout("Size: {$size2} KB");
+
+        PH::print_stdout("Total config size reduction: $reduction%");
+    } else {
+        PH::print_stdout("Cannot perform config size comparison: one or both files not found.");
+    }
+}
+
+#####################################
+# Step 11: End of Script
+#####################################
+
+PH::print_stdout();
+PH::print_stdout("*********** END OF SCRIPT ".basename(__FILE__)." ************");
+PH::print_stdout();
+
+exit(0);
+
+
+
