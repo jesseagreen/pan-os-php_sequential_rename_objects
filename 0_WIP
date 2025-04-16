@@ -530,5 +530,11 @@ PH::print_stdout();
 
 exit(0);
 
+/********************* How to Run
+open powershell
+cd "C:\RE_Runbook\PAN-OS-PHP_share"
+docker run -it --rm --entrypoint /bin/bash -v ${PWD}:/share -w /share swaschkut/pan-os-php:2.1.23
+php convert_dag_to_sag.php in=GSO-MID-PanoA-04.07.2025.xml out=GSO-MID-PanoA-04.07.2025-converted.xml location=GSO_DC1MIDPAFW2 type=custom actions=convert_dag_to_sag | tee pan-os-php-conversion.log
+*/
 
 
