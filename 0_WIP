@@ -301,58 +301,6 @@ fclose($csvHandle);
 PH::print_stdout("CSV output written to $csvFile");
 
 #####################################
-# Step 6: Output CSV of tag removals and SAG membership
-#####################################
-
-$tagRemovalLog = [];
-$sagMembershipMap = [];
-
-// Build SAG membership map from Step 4
-foreach( $dagRuleRefs as $dagName => $info ) {
-    foreach( $info['nestedMembers'] as $memberName ) {
-        // Include every SAG that was created
-        foreach( $sub->addressGroupStore->all() as $ag ) {
-            if( !$ag->isDynamic() && strpos($ag->name(), $dagName . '-SAG') === 0 && $ag->has($memberName) ) {
-                $sagMembershipMap[$memberName][] = $ag->name();
-            }
-        }
-    }
-}
-
-// Re-loop address objects to gather final tag removals (after Step 5)
-foreach( $sub->addressStore->all() as $addrObj ) {
-    $name = $addrObj->name();
-    if( !isset($sagMembershipMap[$name]) ) continue;
-
-    $initialTags = $addrObj->tags->tags(true); // true = return tag names as strings
-    foreach( $tagsToRemove as $tag ) {
-        if( in_array($tag, $initialTags, true) ) {
-            $tagRemovalLog[] = [
-                'address' => $name,
-                'tag' => $tag,
-                'sag_membership' => implode('; ', $sagMembershipMap[$name])
-            ];
-        }
-    }
-}
-
-// Output CSV
-$csvFile = 'address_tag_cleanup_report.csv';
-$csvHandle = fopen($csvFile, 'w');
-fputcsv($csvHandle, ['Address Object', 'Tag Removed', 'Static Address Group(s)']);
-
-foreach( $tagRemovalLog as $entry ) {
-    fputcsv($csvHandle, [
-        $entry['address'],
-        $entry['tag'],
-        $entry['sag_membership']
-    ]);
-}
-
-fclose($csvHandle);
-PH::print_stdout("CSV output written to $csvFile");
-
-#####################################
 # Step 7: Save updated configuration to XML (if out= is set)
 #####################################
 
